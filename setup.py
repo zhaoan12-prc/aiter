@@ -95,7 +95,9 @@ def _is_triton_installed():
 def _run_install_triton():
     print("[aiter] Installing triton via .github/scripts/install_triton.sh")
     install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
-    subprocess.check_call(["bash", install_triton])
+    env = os.environ.copy()
+    env["PYTHON_BIN"] = sys.executable
+    subprocess.check_call(["bash", install_triton], env=env)
 
 
 AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))

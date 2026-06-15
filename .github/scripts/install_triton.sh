@@ -1,13 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-if python3 - <<'PYCHECK' 2>/dev/null
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if "${PYTHON_BIN}" - <<'PYCHECK' 2>/dev/null
 import torch
 from packaging.version import Version
 exit(0 if Version(torch.__version__.split("+")[0].split("dev")[0]) < Version("2.9.1") else 1)
 PYCHECK
 then
-    TRITON_INFO=$(python3 - <<'PYINFO' 2>/dev/null
+    TRITON_INFO=$("${PYTHON_BIN}" - <<'PYINFO' 2>/dev/null
 try:
     import importlib.metadata as m
     for n in ["triton", "triton-rocm", "pytorch-triton-rocm", "pytorch-triton", "amd-triton"]:
@@ -25,8 +27,8 @@ PYINFO
     exit 0
 fi
 
-python3 -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
-python3 -m pip uninstall -y triton-kernels || true
+"${PYTHON_BIN}" -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
+"${PYTHON_BIN}" -m pip uninstall -y triton-kernels || true
 
 install_triton_from_wheelhouse() {
     local wheel_dir="$1"
@@ -46,13 +48,13 @@ install_triton_from_wheelhouse() {
     fi
 
     echo "Installing triton from local wheelhouse: ${wheel_dir}"
-    if ! python3 -m pip install --no-index --find-links "${wheel_dir}" triton; then
+    if ! "${PYTHON_BIN}" -m pip install --no-index --find-links "${wheel_dir}" triton; then
         echo "Local triton wheel install failed; falling back to public index."
         return 1
     fi
 
     echo "Installing triton-kernels from local wheelhouse: ${wheel_dir}"
-    if ! python3 -m pip install --no-index --find-links "${wheel_dir}" triton-kernels; then
+    if ! "${PYTHON_BIN}" -m pip install --no-index --find-links "${wheel_dir}" triton-kernels; then
         echo "Local triton-kernels wheel install failed; falling back to public index."
         return 1
     fi
@@ -70,13 +72,13 @@ fi
 TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
 if ! install_triton_from_wheelhouse "${TRITON_WHEEL_DIR}"; then
     echo "Installing triton from $TRITON_INDEX_URL"
-    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" triton
+    "${PYTHON_BIN}" -m pip install --extra-index-url "$TRITON_INDEX_URL" triton
 
     echo "Installing triton-kernels from $TRITON_INDEX_URL"
-    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" triton-kernels
+    "${PYTHON_BIN}" -m pip install --extra-index-url "$TRITON_INDEX_URL" triton-kernels
 fi
 
-python3 - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import triton
 from packaging.version import Version
 
