@@ -114,7 +114,7 @@ def init_hipblas():
 
 
 def call_hipb_mm(
-    input, weight, bias, scale_a, scale_b, solidx, out_dtype, bpreshuffle=False
+    input, weight, bias, scale_a, scale_b, solidx, out_dtype, bpreshuffle=False, activation=None
 ):
     init_hipblas()
     if scale_b is not None:
@@ -128,6 +128,7 @@ def call_hipb_mm(
         scaleA=scale_a,
         scaleB=scale_b,
         bpreshuffle=bpreshuffle,
+        activation=activation,
     )
 
 

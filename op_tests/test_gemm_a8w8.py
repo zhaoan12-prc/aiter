@@ -73,7 +73,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype, activation=None):
     if scaleB is not None:
         scaleB = scaleB.t()
     return hipb_mm(
@@ -86,7 +86,18 @@ def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
         scaleB=scaleB,
         scaleOut=None,
         bpreshuffle=True,
+        activation=activation,
     )
+
+
+def apply_activation(x, activation):
+    if activation is None or activation == "none":
+        return x
+    if activation == "gelu":
+        return F.gelu(x)
+    if activation == "relu":
+        return F.relu(x)
+    raise ValueError(f"Unsupported activation: {activation}")
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -121,7 +132,16 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    quantDtype=dtypes.i8,
+    pad_a=128,
+    skip_ck=False,
+    activation=None,
+):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
@@ -211,9 +231,26 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
             atol=1e-2,
             catastrophic_check=True,
         )
+        if activation is not None and activation != "none":
+            f, avg_f = run_aiter_hip_bpreshuffle(
+                x, weightshuffle, x_scale, w_scale, dtype, activation=activation
+            )
+            err_f = checkAllclose(
+                apply_activation(a, activation),
+                f,
+                msg=f"hipmm bpreshuffle {activation}: ",
+                rtol=1e-2,
+                atol=1e-2,
+                catastrophic_check=True,
+            )
+        else:
+            avg_f = None
+            err_f = None
     else:
         avg_e = None
         err_e = None
+        avg_f = None
+        err_f = None
     return {
         "ck us": avg_b,
         "ck err": err_b,
@@ -223,6 +260,9 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         "asm err": err_d,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
+        "hipmm bpreshuffle activation": activation,
+        "hipmm bpreshuffle activation us": avg_f,
+        "hipmm bpreshuffle activation err": err_f,
     }
 
 
@@ -354,7 +394,7 @@ def calculate_total_valid_points(cu_count, aligned_k):
 
 
 def test_normal_gemm_a8w8_pertoken_quant(
-    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False
+    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False, activation=None
 ):
     is_gfx1250 = get_gfx() == "gfx1250"
     if is_gfx1250 and not skip_ck:
@@ -370,7 +410,14 @@ def test_normal_gemm_a8w8_pertoken_quant(
                 continue
             for m, n, k in l_mnk:
                 ret = test_gemm(
-                    dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck
+                    dtype,
+                    m,
+                    n,
+                    k,
+                    quantDtype,
+                    pad_a=pad_a,
+                    skip_ck=skip_ck,
+                    activation=activation,
                 )
                 df.append(ret)
     df = pd.DataFrame(df)
@@ -588,13 +635,21 @@ parser.add_argument(
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
+parser.add_argument(
+    "--activation",
+    choices=["none", "gelu", "relu"],
+    default="none",
+    help="Optional hipb_mm activation epilogue to validate. Default: none.",
+)
 
 
 args = parser.parse_args()
+activation = None if args.activation == "none" else args.activation
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
     for kwargs, extras in _iter_flydsl_csv_cases():
+        kwargs["activation"] = activation
         ret = test_gemm(**kwargs)
         ret.update(extras)
         written = append_tuned_op_bench_rows(
@@ -624,7 +679,7 @@ if not args.no_legacy:
         )
 
     df = test_normal_gemm_a8w8_pertoken_quant(
-        args.dtype, args.quantDtype, args.mnk, args.pad_a
+        args.dtype, args.quantDtype, args.mnk, args.pad_a, activation=activation
     )
     if get_gfx() != "gfx1250":
         test_skinny_gemm_a8w8_pertoken_quant()
@@ -659,7 +714,12 @@ if not args.no_legacy:
             )
         )
         df_bpre = test_normal_gemm_a8w8_pertoken_quant(
-            args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
+            args.dtype,
+            args.quantDtype,
+            bpre_mnk,
+            args.pad_a,
+            skip_ck=True,
+            activation=activation,
         )
         if args.output and df_bpre is not None:
             bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(

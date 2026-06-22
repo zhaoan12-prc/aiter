@@ -362,6 +362,7 @@ def hipb_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
+    activation: Optional[str] = None,
     config: Optional[dict] = None,
 ):
     if otype is None:
@@ -371,7 +372,16 @@ def hipb_gemm(
         hipb_create_extension()
         extensions_created = True
     return hipb_mm(
-        inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c, bpreshuffle
+        inp,
+        weights.t(),
+        solidx,
+        bias,
+        otype,
+        scale_a,
+        scale_b,
+        scale_c,
+        bpreshuffle,
+        activation,
     )
 
 

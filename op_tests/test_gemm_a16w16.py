@@ -63,7 +63,7 @@ def run_bf16gemm_asm(
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype, activation=None):
     if scaleB is not None:
         scaleB = scaleB.t()
     return hipb_mm(
@@ -76,7 +76,18 @@ def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
         scaleB=scaleB,
         scaleOut=None,
         bpreshuffle=True,
+        activation=activation,
     )
+
+
+def apply_activation(x, activation):
+    if activation is None or activation == "none":
+        return x
+    if activation == "gelu":
+        return F.gelu(x)
+    if activation == "relu":
+        return F.relu(x)
+    raise ValueError(f"Unsupported activation: {activation}")
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -90,7 +101,17 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    bias=False,
+    otype=None,
+    scaleA=None,
+    scaleB=None,
+    activation=None,
+):
     ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
@@ -133,7 +154,9 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ):
         init_hipblas()
         weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
-        c, avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        c, avg_c = aiter_hip_bpreshuffle(
+            x, weight_bpreshuffle, None, None, otype, activation=activation
+        )
         if bias is not None:
             c = c + bias
     else:
@@ -143,9 +166,10 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             c.dtype == otype
         ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
-        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
+        ref_c = apply_activation(a - bias, activation) + bias if bias is not None else apply_activation(a, activation)
+        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, activation: {activation}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
         err_hipb = (
-            checkAllclose(a, c, msg=msg_c, catastrophic_check=True)
+            checkAllclose(ref_c, c, msg=msg_c, catastrophic_check=True)
             if c is not None
             else None
         )
@@ -495,7 +519,14 @@ parser.add_argument(
     help="""Scale B.
     e.g.: -sb 0.5""",
 )
+parser.add_argument(
+    "--activation",
+    choices=["none", "gelu", "relu"],
+    default="none",
+    help="Optional hipb_mm activation epilogue to validate. Default: none.",
+)
 args = parser.parse_args()
+activation = None if args.activation == "none" else args.activation
 
 df = []
 for test in args.test:
@@ -512,6 +543,7 @@ for test in args.test:
                         otype=otype,
                         scaleA=args.scale_a,
                         scaleB=args.scale_b,
+                        activation=activation,
                     )
                     df.append(ret)
 

@@ -111,6 +111,28 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
 #endif
 };
 
+hipblasLtEpilogue_t get_epilogue(const std::optional<std::string>& activation, bool has_bias)
+{
+    if(!activation.has_value() || activation.value().empty() || activation.value() == "none")
+    {
+        return has_bias ? HIPBLASLT_EPILOGUE_BIAS : HIPBLASLT_EPILOGUE_DEFAULT;
+    }
+
+    if(activation.value() == "gelu")
+    {
+        return has_bias ? HIPBLASLT_EPILOGUE_GELU_BIAS : HIPBLASLT_EPILOGUE_GELU;
+    }
+    if(activation.value() == "relu")
+    {
+        return has_bias ? HIPBLASLT_EPILOGUE_RELU_BIAS : HIPBLASLT_EPILOGUE_RELU;
+    }
+
+    TORCH_CHECK(false,
+                "hipb_mm only supports activation=None, 'none', 'gelu', or 'relu', but got ",
+                activation.value());
+    return HIPBLASLT_EPILOGUE_DEFAULT;
+}
+
 // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
 } // namespace
 
@@ -137,7 +159,9 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
                                                      const void* scaleC,
                                                      hipStream_t& stream,
                                                      bool use_rowwise = false,
-                                                     bool bpreshuffle = false)
+                                                     bool bpreshuffle = false,
+                                                     hipblasLtEpilogue_t epilogue =
+                                                         HIPBLASLT_EPILOGUE_DEFAULT)
 {
     int flag{0};
     hipblasLtMatrixLayout_t matA, matB, matC;
@@ -186,13 +210,17 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &op_B, sizeof(int32_t)));
 
-    if(bias)
+    if(bias || epilogue != HIPBLASLT_EPILOGUE_DEFAULT)
     {
+        auto epilogue_to_set = epilogue == HIPBLASLT_EPILOGUE_DEFAULT ? HIPBLASLT_EPILOGUE_BIAS
+                                                                       : epilogue;
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-            matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
-        auto epilogue = HIPBLASLT_EPILOGUE_BIAS;
-        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-            matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+            matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue_to_set, sizeof(epilogue_to_set)));
+        if(bias)
+        {
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
+        }
     }
 
     if(scaleA != nullptr)
@@ -717,7 +745,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                             const hipStream_t& stream,
                                             int solution_index = -1,
                                             bool bpreshuffle   = false,
-                                            bool use_rowwise   = false)
+                                            bool use_rowwise   = false,
+                                            hipblasLtEpilogue_t epilogue =
+                                                HIPBLASLT_EPILOGUE_DEFAULT)
 {
     // TODO: flag is not supported for hipblasLt yet
     int flag{0};
@@ -813,14 +843,18 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER, &scaleC, sizeof(scaleC)));
     }
-    if(bias)
+    if(bias || epilogue != HIPBLASLT_EPILOGUE_DEFAULT)
     {
+        auto epilogue_to_set = epilogue == HIPBLASLT_EPILOGUE_DEFAULT ? HIPBLASLT_EPILOGUE_BIAS
+                                                                       : epilogue;
+        static_assert(sizeof(epilogue_to_set) == sizeof(int32_t));
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-            matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
-        auto epilogue = HIPBLASLT_EPILOGUE_BIAS;
-        static_assert(sizeof(epilogue) == sizeof(int32_t));
-        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-            matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+            matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue_to_set, sizeof(epilogue_to_set)));
+        if(bias)
+        {
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
+        }
     }
     // nvtxRangePop();
     //  if heuristic does not exist in the map, do search and push into the map
@@ -833,6 +867,12 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // load tuning cache file and check if the gemm has been already tuned
     const char* env = std::getenv("HIP_ONLINE_TUNING");
     bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    bool activation_epilogue = epilogue == HIPBLASLT_EPILOGUE_GELU ||
+                               epilogue == HIPBLASLT_EPILOGUE_GELU_BIAS ||
+                               epilogue == HIPBLASLT_EPILOGUE_RELU ||
+                               epilogue == HIPBLASLT_EPILOGUE_RELU_BIAS;
+    // The tuning CSV schema does not include epilogue, so activation kernels must not reuse plain GEMM algos.
+    online_tuning = online_tuning && !activation_epilogue;
     // check if there is enough memory left for online tuning
     if (online_tuning) {
         size_t freeMem, totalMem;
@@ -1057,7 +1097,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                       std::optional<torch::Tensor> scaleA,
                       std::optional<torch::Tensor> scaleB,
                       std::optional<torch::Tensor> scaleOut,
-                      std::optional<bool> bpreshuffle)
+                      std::optional<bool> bpreshuffle,
+                      std::optional<std::string> activation)
 {
     bool bpreshuffle_flag = bpreshuffle.value_or(false);
 
@@ -1204,6 +1245,7 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
     const hipStream_t current_stream = at::hip::getCurrentHIPStream();
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
+    hipblasLtEpilogue_t epilogue = get_epilogue(activation, bias_ptr != nullptr);
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
                                                     transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
@@ -1228,7 +1270,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                                                     current_stream,
                                                     solution_index,
                                                     bpreshuffle_flag,
-                                                    use_rowwise));
+                                                    use_rowwise,
+                                                    epilogue));
 
     return result;
 }
@@ -1241,7 +1284,8 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                   std::optional<torch::Tensor> scaleA,
                                   std::optional<torch::Tensor> scaleB,
                                   std::optional<torch::Tensor> scaleC,
-                                  bool bpreshuffle)
+                                  bool bpreshuffle,
+                                  std::optional<std::string> activation)
 {
     auto mat1_strides{mat1.strides()};
     auto mat2_strides{mat2.strides()};
@@ -1320,6 +1364,7 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
     auto scaleB_ptr = scaleB.has_value() ? static_cast<void*>(scaleB.value().data_ptr()) : nullptr;
 
     auto scaleC_ptr = scaleC.has_value() ? static_cast<void*>(scaleC.value().data_ptr()) : nullptr;
+    hipblasLtEpilogue_t epilogue = get_epilogue(activation, bias_ptr != nullptr);
 
     bool use_rowwise = false;
     if(scaleA.has_value() && scaleB.has_value())
@@ -1357,7 +1402,8 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                                scaleC_ptr,
                                                current_stream,
                                                use_rowwise,
-                                               bpreshuffle);
+                                               bpreshuffle,
+                                               epilogue);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1423,7 +1469,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scaleA")      = std::nullopt,
           py::arg("scaleB")      = std::nullopt,
           py::arg("scaleOut")    = std::nullopt,
-          py::arg("bpreshuffle") = std::nullopt);
+          py::arg("bpreshuffle") = std::nullopt,
+          py::arg("activation")  = std::nullopt);
     m.def("hipb_findallsols",
           &hipb_findallsols,
           "hipb_findallsols",
@@ -1434,7 +1481,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scaleA")      = std::nullopt,
           py::arg("scaleB")      = std::nullopt,
           py::arg("scaleC")      = std::nullopt,
-          py::arg("bpreshuffle") = false);
+          py::arg("bpreshuffle") = false,
+          py::arg("activation")  = std::nullopt);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
 
